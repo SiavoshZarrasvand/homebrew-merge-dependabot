@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+merge-dependabot
+
+One command to:
+1. Find and merge all Dependabot pull requests in ~/Documents/Github that have
+   passed CI / green builds.
+2. Run `git fetch --all --prune` and `git pull --rebase` across all repositories
+   in ~/Documents/Github (regardless of whether they had Dependabot updates).
+
+Usage:
+  merge-dependabot             # Merges green Dependabot PRs & pulls latest changes on all repos
+  merge-dependabot --dry-run   # Preview what Dependabot PRs would be merged
+  merge-dependabot --skip-sync # Only merge Dependabot PRs without pulling local repos
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import List, Dict, Any, Tuple, Optional
+
+VERSION = "1.0.0"
+DEFAULT_GITHUB_DIR = os.path.expanduser("~/Documents/Github")
+
+
+def run_cmd(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    return res.returncode, res.stdout, res.stderr
+
+
+def check_gh_cli():
+    code, _, _ = run_cmd(["which", "gh"])
+    if code != 0:
+        print("Error: GitHub CLI (`gh`) is not installed or not in PATH.", file=sys.stderr)
+        print("Install it with: brew install gh", file=sys.stderr)
+        sys.exit(1)
+
+    code, _, _ = run_cmd(["gh", "auth", "status"])
+    if code != 0:
+        print("Error: `gh` is not authenticated. Please run `gh auth login`.", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_github_nwo(url: str) -> str:
+    """Extracts owner/repo from https or ssh GitHub URLs."""
+    match = re.search(r"github\.com[:/]([^/]+)/([^/.]+)(?:\.git)?", url.strip())
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    return ""
+
+
+def get_local_repos_nwo(base_dir: str) -> set:
+    """Returns a set of 'owner/repo' strings found in local subdirectories."""
+    repos = set()
+    if not os.path.isdir(base_dir):
+        return repos
+
+    for entry in os.listdir(base_dir):
+        repo_path = os.path.join(base_dir, entry)
+        if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, ".git")):
+            continue
+
+        code, out, _ = run_cmd(["git", "config", "--get", "remote.origin.url"], cwd=repo_path)
+        if code == 0 and out.strip():
+            nwo = parse_github_nwo(out)
+            if nwo:
+                repos.add(nwo.lower())
+    return repos
+
+
+def evaluate_ci(status_checks: List[Dict[str, Any]], require_ci: bool) -> Tuple[bool, str]:
+    """
+    Evaluates the statusCheckRollup for a PR.
+    Returns (is_green, reason).
+    """
+    if not status_checks:
+        if require_ci:
+            return False, "No CI checks found (--require-ci enabled)"
+        return True, "No CI configured (assumed clean)"
+
+    success_conclusions = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+    pending_statuses = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING"}
+    failed_conclusions = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+
+    has_pending = False
+    failures = []
+    successes = 0
+
+    for check in status_checks:
+        type_name = check.get("__typename", "")
+        name = check.get("name") or check.get("context") or "Unknown check"
+
+        if type_name == "CheckRun":
+            status = (check.get("status") or "").upper()
+            conclusion = (check.get("conclusion") or "").upper()
+
+            if status in pending_statuses or not conclusion:
+                has_pending = True
+            elif conclusion in failed_conclusions:
+                failures.append(f"{name} ({conclusion})")
+            elif conclusion in success_conclusions:
+                successes += 1
+            else:
+                failures.append(f"{name} ({conclusion})")
+
+        elif type_name == "StatusContext":
+            state = (check.get("state") or "").upper()
+            if state in pending_statuses:
+                has_pending = True
+            elif state == "SUCCESS":
+                successes += 1
+            else:
+                failures.append(f"{name} ({state})")
+
+    if failures:
+        return False, f"Failed checks: {', '.join(failures)}"
+    if has_pending:
+        return False, "Checks currently in progress or queued"
+    if successes > 0 or not require_ci:
+        return True, f"All {successes} checks passed"
+
+    return False, "No passing checks recorded"
+
+
+def fetch_open_dependabot_prs() -> List[Dict[str, Any]]:
+    cmd = [
+        "gh", "search", "prs",
+        "--owner", "@me",
+        "--author", "app/dependabot",
+        "--state", "open",
+        "--json", "number,title,repository,url"
+    ]
+    code, stdout, stderr = run_cmd(cmd)
+    if code != 0:
+        print(f"Error querying Dependabot PRs: {stderr.strip()}", file=sys.stderr)
+        return []
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def get_pr_details(repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
+    cmd = [
+        "gh", "pr", "view", str(pr_number),
+        "--repo", repo,
+        "--json", "number,title,mergeable,mergeStateStatus,statusCheckRollup,url"
+    ]
+    code, stdout, _ = run_cmd(cmd)
+    if code != 0:
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def merge_pr(repo: str, pr_number: int, preferred_strategy: str = "rebase", delete_branch: bool = True) -> bool:
+    strategies = [preferred_strategy]
+    for alt in ["rebase", "squash", "merge"]:
+        if alt not in strategies:
+            strategies.append(alt)
+
+    for strat in strategies:
+        cmd = ["gh", "pr", "merge", str(pr_number), "--repo", repo, f"--{strat}"]
+        if delete_branch:
+            cmd.append("--delete-branch")
+
+        code, stdout, stderr = run_cmd(cmd)
+        if code == 0:
+            print(f"  ✓ Merged PR #{pr_number} using --{strat}")
+            return True
+
+        err = (stderr + " " + stdout).strip()
+        if "not allowed for this repository" in err.lower() or "not enabled" in err.lower():
+            continue
+        else:
+            print(f"  ✗ Failed to merge PR #{pr_number}: {err}")
+            return False
+
+    print(f"  ✗ Could not merge PR #{pr_number} (none of the allowed merge methods worked)")
+    return False
+
+
+def sync_all_repositories(target_dir: str):
+    print(f"\n========================================================")
+    print(f"Syncing all repositories in {target_dir}")
+    print(f"Running: git fetch --all --prune && git pull --rebase")
+    print(f"========================================================\n")
+
+    entries = sorted(os.listdir(target_dir))
+    for entry in entries:
+        repo_path = os.path.join(target_dir, entry)
+        if not os.path.isdir(repo_path) or not os.path.isdir(os.path.join(repo_path, ".git")):
+            continue
+
+        print(f"[{entry}]")
+        # 1. Fetch
+        code_fetch, out_fetch, err_fetch = run_cmd(["git", "fetch", "--all", "--prune"], cwd=repo_path)
+        if code_fetch != 0:
+            print(f"  ✗ fetch error: {err_fetch.strip() or out_fetch.strip()}")
+        else:
+            fetch_msg = (out_fetch.strip() + "\n" + err_fetch.strip()).strip()
+            if fetch_msg:
+                lines = [l for l in fetch_msg.splitlines() if l.strip()]
+                for l in lines[:3]:
+                    print(f"    {l}")
+                if len(lines) > 3:
+                    print(f"    ... (+{len(lines)-3} more fetch updates)")
+            else:
+                print("  ✓ fetch up to date")
+
+        # 2. Check for dirty working tree before rebase
+        code_st, out_st, _ = run_cmd(["git", "status", "--porcelain"], cwd=repo_path)
+        if out_st.strip():
+            print(f"  ⚠ uncommitted changes in working tree; skipping pull --rebase")
+            print()
+            continue
+
+        # 3. Pull rebase
+        code_pull, out_pull, err_pull = run_cmd(["git", "pull", "--rebase"], cwd=repo_path)
+        if code_pull != 0:
+            print(f"  ✗ pull --rebase error: {err_pull.strip() or out_pull.strip()}")
+        else:
+            first_line = out_pull.strip().splitlines()[0] if out_pull.strip() else "Up to date"
+            print(f"  ✓ {first_line}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge green Dependabot PRs and pull latest changes on all repos in ~/Documents/Github."
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}"
+    )
+    parser.add_argument(
+        "--dir",
+        type=str,
+        default=DEFAULT_GITHUB_DIR,
+        help=f"Target directory containing git repositories (default: {DEFAULT_GITHUB_DIR})."
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=["rebase", "squash", "merge"],
+        default="rebase",
+        help="Preferred merge strategy (default: rebase; falls back to squash/merge if repo requires)."
+    )
+    parser.add_argument(
+        "--require-ci",
+        action="store_true",
+        help="Only merge if at least one green CI check explicitly ran (skips repos with no CI)."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what will be merged without modifying GitHub PRs or pulling."
+    )
+    parser.add_argument(
+        "--keep-branch",
+        action="store_true",
+        help="Do not delete the remote branch upon merge."
+    )
+    parser.add_argument(
+        "--skip-sync",
+        action="store_true",
+        help="Do not run git fetch & git pull --rebase across repositories."
+    )
+
+    args = parser.parse_args()
+    check_gh_cli()
+
+    target_dir = os.path.abspath(os.path.expanduser(args.dir))
+    print(f"Target directory: {target_dir}")
+
+    local_nwos = get_local_repos_nwo(target_dir)
+    if not local_nwos:
+        print(f"No git repositories found in {target_dir}.")
+        return
+
+    # Phase 1: Dependabot PR Handling
+    print("\n--- Phase 1: Checking Dependabot Pull Requests ---")
+    all_prs = fetch_open_dependabot_prs()
+    matching_prs = [
+        p for p in all_prs
+        if p.get("repository", {}).get("nameWithOwner", "").lower() in local_nwos
+    ]
+
+    total_evaluated = 0
+    total_eligible = 0
+    total_merged = 0
+
+    if not matching_prs:
+        print("No open Dependabot PRs found matching your repositories.")
+    else:
+        print(f"Found {len(matching_prs)} open Dependabot PR(s):\n")
+        for item in matching_prs:
+            total_evaluated += 1
+            repo = item.get("repository", {}).get("nameWithOwner")
+            pr_num = item.get("number")
+
+            pr_details = get_pr_details(repo, pr_num) or item
+            title = pr_details.get("title", "")
+            mergeable = pr_details.get("mergeable", "UNKNOWN")
+            merge_state = pr_details.get("mergeStateStatus", "UNKNOWN")
+            checks = pr_details.get("statusCheckRollup") or []
+
+            is_green, ci_reason = evaluate_ci(checks, args.require_ci)
+
+            print(f"[{repo}] PR #{pr_num}: {title}")
+            print(f"  CI Status : {ci_reason}")
+            print(f"  Mergeable : {mergeable} (state: {merge_state})")
+
+            if not is_green:
+                print(f"  Action    : [SKIPPED] CI is not green or is in progress.\n")
+                continue
+
+            if mergeable == "CONFLICTING" or merge_state == "DIRTY":
+                print(f"  Action    : [SKIPPED] Has merge conflicts.\n")
+                continue
+
+            total_eligible += 1
+            if args.dry_run:
+                print(f"  Action    : [DRY-RUN] Would merge via --{args.strategy}\n")
+            else:
+                print(f"  Action    : Merging...")
+                success = merge_pr(repo, pr_num, args.strategy, not args.keep_branch)
+                if success:
+                    total_merged += 1
+                print()
+
+    print("================== Dependabot Summary ==================")
+    print(f"Total Dependabot PRs evaluated : {total_evaluated}")
+    print(f"Eligible (Green / Clean)       : {total_eligible}")
+    if args.dry_run:
+        print("Status                         : Dry run complete (no PRs merged)")
+    else:
+        print(f"Successfully Merged            : {total_merged}")
+
+    # Phase 2: Git Fetch & Pull Rebase
+    if args.dry_run:
+        print("\n[DRY-RUN] Skipping repository fetch and pull.")
+    elif args.skip_sync:
+        print("\n[SKIP-SYNC] Skipping repository fetch and pull as requested.")
+    else:
+        print("\n--- Phase 2: Updating Local Repositories ---")
+        sync_all_repositories(target_dir)
+
+    print("\nAll done!")
+
+
+if __name__ == "__main__":
+    main()
