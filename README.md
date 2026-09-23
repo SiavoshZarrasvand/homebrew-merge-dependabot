@@ -1,6 +1,6 @@
 # homebrew-merge-dependabot
 
-Homebrew formula for `merge-dependabot` — a command-line tool to automatically merge green Dependabot PRs and sync all local repositories in `~/Documents/Github`.
+Homebrew formula for `merge-dependabot` - a command-line tool to automatically merge green Dependabot PRs and sync all local repositories in `~/Documents/Github`.
 
 ## Installation
 
